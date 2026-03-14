@@ -1,0 +1,17 @@
+{
+  "env": {
+    "VIRTUAL_ENV": ".venv",
+    "PATH": ".venv/bin:$PATH"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git:*)",
+      "Bash(python:*)",
+      "Bash(pip:*)",
+      "Bash(source:*)",
+      "Read(*)",
+      "Write(*)"
+    ],
+    "deny": []
+  }
+}
