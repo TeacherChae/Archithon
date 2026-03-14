@@ -150,6 +150,14 @@ class ArchithonPipeline:
             meshes, mesh_dir, formats=cfg.mesh_output_formats
         )
 
+        # CUDA 컨텍스트 정리 — native 라이브러리 double free 방지
+        try:
+            import torch
+            torch.cuda.empty_cache()
+            del depth, seg, cloud, meshes
+        except Exception:
+            pass
+
         print(f"\n완료. 출력 디렉토리: {out}")
         return saved
 
@@ -182,3 +190,7 @@ if __name__ == "__main__":
     for label, paths in result.items():
         for p in paths:
             print(f"  {p}")
+
+    # SAM3/MoGe CUDA extension의 exit-time double free 방지
+    import os as _os
+    _os._exit(0)
