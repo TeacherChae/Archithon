@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -14,17 +14,28 @@ from .image_loader import ImageData
 
 @dataclass
 class Prompt:
+    """
+    SAM3 grounding 프롬프트.
+
+    label            : 자연어 텍스트 ("roof", "brick wall", "window" 등)
+    box              : 선택적 기하학적 힌트 박스
+                       (cx, cy, w, h) 형식, 이미지 크기 기준 정규화 [0, 1]
+                       예) 이미지 중앙 절반 → (0.5, 0.5, 0.5, 0.5)
+    box_positive     : True = 전경(포함) 박스, False = 배경(제외) 박스
+    merge_instances  : True  → 탐지된 여러 인스턴스를 하나의 마스크로 합침 (OR)
+                       False → score 가장 높은 단일 인스턴스만 사용
+    """
     label: str
-    points: list[tuple[int, int]] | None = None      # [(x, y), ...]
-    point_labels: list[int] | None = None             # 1=전경, 0=배경
-    box: tuple[int, int, int, int] | None = None      # (x1, y1, x2, y2)
+    box: tuple[float, float, float, float] | None = None  # (cx, cy, w, h) normalized
+    box_positive: bool = True
+    merge_instances: bool = True
 
 
 @dataclass
 class SegResult:
     masks: list[np.ndarray]    # List of (H, W) bool
     labels: list[str]          # 각 마스크의 레이블 이름
-    scores: list[float]        # 예측 신뢰도
+    scores: list[float]        # 예측 신뢰도 (인스턴스가 여럿이면 최고 score)
 
     def save(self, directory: str, image_rgb: np.ndarray | None = None) -> None:
         """
@@ -39,15 +50,13 @@ class SegResult:
         )
         # ── RGBA 마스크 이미지 ────────────────────────────────
         if image_rgb is not None:
-            H_img, W_img = image_rgb.shape[:2]
-            # 컬러 오버레이 (모든 레이블을 하나의 이미지에)
             overlay = image_rgb.copy()
             palette = [
-                (255, 80,  80),   # red
-                (80,  200, 80),   # green
-                (80,  120, 255),  # blue
-                (255, 200, 50),   # yellow
-                (200, 80,  255),  # purple
+                (255, 80,  80),
+                (80,  200, 80),
+                (80,  120, 255),
+                (255, 200, 50),
+                (200, 80,  255),
             ]
             for i, (mask, lbl) in enumerate(zip(self.masks, self.labels)):
                 color = palette[i % len(palette)]
@@ -59,10 +68,9 @@ class SegResult:
                 os.path.join(directory, "overlay.png"),
                 cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
             )
-            # 레이블별 RGBA (배경 투명)
             for mask, lbl in zip(self.masks, self.labels):
-                alpha = mask.astype(np.uint8) * 255           # (H, W)
-                rgba = np.dstack([image_rgb, alpha])           # (H, W, 4)
+                alpha = mask.astype(np.uint8) * 255
+                rgba = np.dstack([image_rgb, alpha])
                 cv2.imwrite(
                     os.path.join(directory, f"{lbl}_masked.png"),
                     cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA),
@@ -71,7 +79,7 @@ class SegResult:
         H, W = (self.masks[0].shape if self.masks else (0, 0))
         features = []
         for i, (lbl, mask, score) in enumerate(zip(self.labels, self.masks, self.scores)):
-            ys, xs = np.where(mask)   # True 픽셀의 행(y)·열(x)
+            ys, xs = np.where(mask)
             bbox = ([int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
                     if len(xs) else None)
             features.append({
@@ -79,7 +87,6 @@ class SegResult:
                 "id": lbl,
                 "geometry": {
                     "type": "MultiPoint",
-                    # GeoJSON Position: [x, y] = [열(col), 행(row)] — 이미지 픽셀 좌표
                     "coordinates": np.stack([xs, ys], axis=1).tolist(),
                 },
                 "properties": {
@@ -87,7 +94,6 @@ class SegResult:
                     "sam3_score": round(score, 6),
                     "pixel_count": int(mask.sum()),
                     "coverage_pct": round(float(mask.mean()) * 100, 2),
-                    # [x_min, y_min, x_max, y_max] 픽셀 좌표
                     "bbox_xyxy": bbox,
                 },
             })
@@ -97,6 +103,7 @@ class SegResult:
             "properties": {
                 "source": "SAM3",
                 "model": "facebook/sam3",
+                "inference": "grounding",
                 "image_shape": {"H": int(H), "W": int(W)},
                 "num_labels": len(self.labels),
                 "labels": self.labels,
@@ -126,89 +133,87 @@ class BaseSegmentor(ABC):
 
 class SAMSegmentor(BaseSegmentor):
     """
-    SAM3 기반 세그멘테이션.
+    SAM3 grounding 기반 세그멘테이션.
 
-    추론 경로:
-      1. SAM2Transforms(1008) 로 이미지 전처리
-      2. model.backbone.forward_image() 로 피처 추출
-      3. model.predict_inst(inference_state, ...) 로 point/box 프롬프트 마스크 예측
+    추론 경로 (Sam3Processor):
+      1. set_image()       : 이미지 → 비전 피처 추출 (1회)
+      2. set_text_prompt() : 텍스트 → 언어 피처 추출 → forward_grounding
+      3. add_geometric_prompt() : (선택) 박스 힌트 → forward_grounding 재실행
+
+    반환된 state["masks"] : (K, 1, H, W) bool  — K개 인스턴스
+    Prompt.merge_instances=True  → K개 마스크를 OR 합산
+    Prompt.merge_instances=False → score 최고 인스턴스만 선택
     """
 
-    IMAGE_SIZE = 1008
-
-    def __init__(self, device: str = "cuda"):
+    def __init__(self, device: str = "cuda", confidence_threshold: float = 0.3):
         from sam3 import build_sam3_image_model
-        from sam3.model.utils.sam1_utils import SAM2Transforms
+        from sam3.model.sam3_image_processor import Sam3Processor
 
         self.device = device
-        self.model = build_sam3_image_model(
+        model = build_sam3_image_model(
             device=device,
             load_from_HF=True,
-            enable_inst_interactivity=True,
+            enable_segmentation=True,
+            enable_inst_interactivity=False,
         )
-        self.model.eval()
-
-        # 이미지 전처리 & 마스크 후처리용 transforms
-        self.transforms = SAM2Transforms(
-            resolution=self.IMAGE_SIZE,
-            mask_threshold=0.0,
+        model.eval()
+        self.processor = Sam3Processor(
+            model,
+            resolution=1008,
+            device=device,
+            confidence_threshold=confidence_threshold,
         )
 
     @torch.inference_mode()
     def segment(self, image: ImageData, prompts: list[Prompt]) -> SegResult:
+        from PIL import Image as PILImage
+
         H, W = image.height, image.width
+        pil_image = PILImage.fromarray(image.rgb)
 
-        # 1. 이미지 전처리: (H,W,3) uint8 → (1,3,1008,1008) float32 [-1,1]
-        preprocessed = self.transforms(image.rgb).unsqueeze(0).to(self.device)
+        # 이미지 피처는 한 번만 추출
+        state = self.processor.set_image(pil_image)
 
-        # 2. 백본 피처 추출 (SAM3 + SAM2 dual features)
-        full_backbone_out = self.model.backbone.forward_image(preprocessed)
-
-        # 3. sam2_backbone_out에 SAM tracker의 conv_s0/conv_s1 프로젝션 적용
-        #    Sam3TrackerBase.forward_image가 하는 것과 동일
-        sam2_out = full_backbone_out["sam2_backbone_out"]
-        tracker = self.model.inst_interactive_predictor.model
-        sam2_out["backbone_fpn"][0] = tracker.sam_mask_decoder.conv_s0(sam2_out["backbone_fpn"][0])
-        sam2_out["backbone_fpn"][1] = tracker.sam_mask_decoder.conv_s1(sam2_out["backbone_fpn"][1])
-        for i in range(len(sam2_out["backbone_fpn"])):
-            sam2_out["backbone_fpn"][i] = sam2_out["backbone_fpn"][i].clone()
-            sam2_out["vision_pos_enc"][i] = sam2_out["vision_pos_enc"][i].clone()
-
-        # inference_state 구성
-        inference_state = {
-            "backbone_out": {"sam2_backbone_out": sam2_out},
-            "original_height": H,
-            "original_width": W,
-        }
-
-        masks_out: list[np.ndarray] = []
-        labels_out: list[str] = []
-        scores_out: list[float] = []
+        masks_out:  list[np.ndarray] = []
+        labels_out: list[str]        = []
+        scores_out: list[float]      = []
 
         for prompt in prompts:
-            point_coords = (
-                np.array(prompt.points, dtype=np.float32) if prompt.points else None
-            )
-            point_labels = (
-                np.array(prompt.point_labels, dtype=np.int32) if prompt.point_labels else None
-            )
-            box = (
-                np.array(prompt.box, dtype=np.float32) if prompt.box else None
-            )
+            self.processor.reset_all_prompts(state)
 
-            # predict_inst가 내부적으로 inst_interactive_predictor에
-            # backbone 피처를 주입하고 SAM-style predict를 수행
-            masks, scores, _ = self.model.predict_inst(
-                inference_state,
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box=box,
-                multimask_output=True,
-            )
+            # 텍스트 프롬프트 → grounding 실행
+            state = self.processor.set_text_prompt(prompt.label, state)
 
-            best_idx = int(np.argmax(scores))
-            masks_out.append(masks[best_idx].astype(bool))
+            # 선택적 박스 힌트 → grounding 재실행
+            if prompt.box is not None:
+                state = self.processor.add_geometric_prompt(
+                    box=list(prompt.box),
+                    label=prompt.box_positive,
+                    state=state,
+                )
+
+            # 결과 수집
+            if "masks" in state and len(state["masks"]) > 0:
+                # state["masks"]: (K, 1, H, W) bool tensor
+                # state["scores"]: (K,) float tensor
+                k_masks  = state["masks"].squeeze(1).cpu().numpy()  # (K, H, W)
+                k_scores = state["scores"].cpu().numpy()            # (K,)
+
+                if prompt.merge_instances:
+                    # 모든 인스턴스 OR 합산 → 창문처럼 여러 개인 경우 유리
+                    mask  = k_masks.any(axis=0)                     # (H, W)
+                    score = float(k_scores.max())
+                else:
+                    best  = int(k_scores.argmax())
+                    mask  = k_masks[best]
+                    score = float(k_scores[best])
+            else:
+                print(f"[{prompt.label}] confidence threshold 이하 — 빈 마스크 반환")
+                mask  = np.zeros((H, W), dtype=bool)
+                score = 0.0
+
+            masks_out.append(mask)
             labels_out.append(prompt.label)
-            scores_out.append(float(scores[best_idx]))
+            scores_out.append(score)
 
         return SegResult(masks=masks_out, labels=labels_out, scores=scores_out)
