@@ -24,3 +24,6 @@ scipy
 trimesh
 huggingface_hub
 matplotlib
+
+# 환경변수 (.env 로딩)
+python-dotenv
