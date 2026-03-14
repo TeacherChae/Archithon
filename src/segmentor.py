@@ -1,6 +1,11 @@
+from __future__ import annotations
+
+import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 import torch
 
@@ -20,6 +25,98 @@ class SegResult:
     masks: list[np.ndarray]    # List of (H, W) bool
     labels: list[str]          # 각 마스크의 레이블 이름
     scores: list[float]        # 예측 신뢰도
+
+    def save(self, directory: str, image_rgb: np.ndarray | None = None) -> None:
+        """
+        directory  : 출력 디렉토리
+        image_rgb  : (H, W, 3) uint8 원본 이미지 — 제공 시 레이블별 RGBA PNG도 저장
+        """
+        os.makedirs(directory, exist_ok=True)
+        # ── .npz ─────────────────────────────────────────────
+        np.savez_compressed(
+            os.path.join(directory, "seg_result.npz"),
+            **{f"mask_{i}": m for i, m in enumerate(self.masks)},
+        )
+        # ── RGBA 마스크 이미지 ────────────────────────────────
+        if image_rgb is not None:
+            H_img, W_img = image_rgb.shape[:2]
+            # 컬러 오버레이 (모든 레이블을 하나의 이미지에)
+            overlay = image_rgb.copy()
+            palette = [
+                (255, 80,  80),   # red
+                (80,  200, 80),   # green
+                (80,  120, 255),  # blue
+                (255, 200, 50),   # yellow
+                (200, 80,  255),  # purple
+            ]
+            for i, (mask, lbl) in enumerate(zip(self.masks, self.labels)):
+                color = palette[i % len(palette)]
+                overlay[mask] = (
+                    overlay[mask].astype(np.float32) * 0.45
+                    + np.array(color, dtype=np.float32) * 0.55
+                ).astype(np.uint8)
+            cv2.imwrite(
+                os.path.join(directory, "overlay.png"),
+                cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
+            )
+            # 레이블별 RGBA (배경 투명)
+            for mask, lbl in zip(self.masks, self.labels):
+                alpha = mask.astype(np.uint8) * 255           # (H, W)
+                rgba = np.dstack([image_rgb, alpha])           # (H, W, 4)
+                cv2.imwrite(
+                    os.path.join(directory, f"{lbl}_masked.png"),
+                    cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA),
+                )
+        # ── GeoJSON ───────────────────────────────────────────
+        H, W = (self.masks[0].shape if self.masks else (0, 0))
+        features = []
+        for i, (lbl, mask, score) in enumerate(zip(self.labels, self.masks, self.scores)):
+            ys, xs = np.where(mask)   # True 픽셀의 행(y)·열(x)
+            bbox = ([int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                    if len(xs) else None)
+            features.append({
+                "type": "Feature",
+                "id": lbl,
+                "geometry": {
+                    "type": "MultiPoint",
+                    # GeoJSON Position: [x, y] = [열(col), 행(row)] — 이미지 픽셀 좌표
+                    "coordinates": np.stack([xs, ys], axis=1).tolist(),
+                },
+                "properties": {
+                    "label": lbl,
+                    "sam3_score": round(score, 6),
+                    "pixel_count": int(mask.sum()),
+                    "coverage_pct": round(float(mask.mean()) * 100, 2),
+                    # [x_min, y_min, x_max, y_max] 픽셀 좌표
+                    "bbox_xyxy": bbox,
+                },
+            })
+
+        geojson = {
+            "type": "FeatureCollection",
+            "properties": {
+                "source": "SAM3",
+                "model": "facebook/sam3",
+                "image_shape": {"H": int(H), "W": int(W)},
+                "num_labels": len(self.labels),
+                "labels": self.labels,
+            },
+            "features": features,
+        }
+        with open(os.path.join(directory, "seg_result.json"), "w") as f:
+            json.dump(geojson, f, indent=2)
+        print(f"[SegResult] 저장 → {directory}")
+
+    @classmethod
+    def load(cls, directory: str) -> SegResult:
+        data = np.load(os.path.join(directory, "seg_result.npz"))
+        with open(os.path.join(directory, "seg_result.json")) as f:
+            geo = json.load(f)
+        features = geo["features"]
+        labels = [f["properties"]["label"] for f in features]
+        scores = [f["properties"]["sam3_score"] for f in features]
+        masks  = [data[f"mask_{i}"].astype(bool) for i in range(len(features))]
+        return cls(masks=masks, labels=labels, scores=scores)
 
 
 class BaseSegmentor(ABC):

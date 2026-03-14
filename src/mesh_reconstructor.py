@@ -14,8 +14,8 @@ class MeshReconstructor:
         method: Literal["poisson", "bpa", "alpha"] = "poisson",
         depth: int = 9,
         radii: list[float] | None = None,
-        voxel_size: float | None = 0.02,   # None이면 다운샘플링 생략
-        max_points: int = 200_000,          # voxel_size 지정 없을 때 point cap
+        voxel_size: float | None = None,    # None이면 max_points 기반 random sampling
+        max_points: int = 150_000,          # 라벨당 최대 포인트 수
     ):
         self.method = method
         self.poisson_depth = depth
