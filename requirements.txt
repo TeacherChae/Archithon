@@ -1,0 +1,26 @@
+# ──────────────────────────────────────────────
+# Archithon — Python dependencies
+# torch는 별도 설치 (CUDA 버전에 따라 다름)
+#   로컬 (CPU):  bash scripts/install_torch_cpu.sh
+#   서버 (CUDA): RunPod PyTorch 이미지에 torch 포함됨
+# ──────────────────────────────────────────────
+
+# MoGe-2 (microsoft) — utils3d, pipeline git deps 포함
+moge @ git+ssh://git@github.com/microsoft/MoGe.git
+
+# SAM3 (Meta)
+sam3 @ git+ssh://org-16943930@github.com/facebookresearch/sam3.git
+
+# 메시 재구성
+open3d
+
+# 이미지 / 배열
+opencv-python
+numpy
+pillow
+
+# 기타 (MoGe pyproject.toml에 포함되지만 명시)
+scipy
+trimesh
+huggingface_hub
+matplotlib
