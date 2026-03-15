@@ -26,7 +26,7 @@ class MeshData:
 class MeshReconstructor:
     def __init__(
         self,
-        method: Literal["range_image", "gpu_poisson", "voxel_mc", "poisson", "bpa", "alpha"] = "range_image",
+        method: Literal["delaunay2d", "range_image", "gpu_poisson", "voxel_mc", "poisson", "bpa", "alpha"] = "delaunay2d",
         depth: int = 9,                        # poisson / gpu_poisson 전용
         radii: list[float] | None = None,      # bpa 전용
         voxel_size: float | None = None,
@@ -69,12 +69,20 @@ class MeshReconstructor:
                 print(f"[{label}] 유효 픽셀 부족 ({combined.sum()}px), 스킵")
                 continue
 
-            mesh = self._range_image_mesh(
-                points=points,
-                mask=combined,
-                colors=colors,
-                normals=normals,
-            )
+            if self.method == "delaunay2d":
+                mesh = self._delaunay2d_mesh(
+                    points=points,
+                    mask=combined,
+                    colors=colors,
+                    normals=normals,
+                )
+            else:
+                mesh = self._range_image_mesh(
+                    points=points,
+                    mask=combined,
+                    colors=colors,
+                    normals=normals,
+                )
 
             if mesh is not None:
                 meshes[label] = mesh
@@ -197,23 +205,19 @@ class MeshReconstructor:
             print(f"지원하지 않는 포맷: {fmt}")
 
     def _write_ply(self, mesh: MeshData, path: str) -> None:
-        """float32 binary PLY — Open3D double 문제 없이 Rhino 호환"""
+        """float32 binary PLY — Rhino 호환 (normals 제외: 헤더·바이너리 일치)"""
         V = len(mesh.vertices)
         F = len(mesh.faces)
 
-        # vertex 구조체 dtype
+        # normals는 헤더와 바이너리 모두 제외 — Rhino PLY importer 호환
+        # (헤더에 없는 필드가 바이너리에 있으면 색상 오프셋이 밀려 잘못 읽힘)
         fields: list[tuple] = [('x', '<f4'), ('y', '<f4'), ('z', '<f4')]
-        if mesh.has_normals:
-            fields += [('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4')]
         if mesh.has_colors:
             fields += [('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
 
         vdata = np.zeros(V, dtype=np.dtype(fields))
         v32 = mesh.vertices.astype(np.float32)
         vdata['x'], vdata['y'], vdata['z'] = v32[:, 0], v32[:, 1], v32[:, 2]
-        if mesh.has_normals:
-            n32 = mesh.normals.astype(np.float32)
-            vdata['nx'], vdata['ny'], vdata['nz'] = n32[:, 0], n32[:, 1], n32[:, 2]
         if mesh.has_colors:
             c8 = mesh.colors.astype(np.uint8)
             vdata['red'], vdata['green'], vdata['blue'] = c8[:, 0], c8[:, 1], c8[:, 2]
@@ -227,7 +231,6 @@ class MeshReconstructor:
         f32 = mesh.faces.astype(np.int32)
         fdata['v0'], fdata['v1'], fdata['v2'] = f32[:, 0], f32[:, 1], f32[:, 2]
 
-        # header — normals 제외 (Rhino PLY importer 호환성)
         hlines = [
             "ply",
             "format binary_little_endian 1.0",
@@ -329,6 +332,107 @@ print(f"[3dm] 저장 완료: {out_path}  ({len(meshes)} 레이어)")
                 print(result.stdout.strip())
         finally:
             os.unlink(tmp_path)
+
+    # ── delaunay2d: GPU 서브샘플 + CPU 2D Delaunay + GPU 필터 ────────
+
+    def _delaunay2d_mesh(
+        self,
+        points: np.ndarray,          # (H, W, 3) 카메라 좌표계
+        mask: np.ndarray,            # (H, W) bool
+        colors: np.ndarray,          # (H, W, 3) uint8
+        normals: np.ndarray | None,  # (H, W, 3)
+    ) -> "MeshData | None":
+        """
+        픽셀 좌표계 2D Delaunay 삼각화.
+
+        CUDA:  서브샘플링 (randperm), 유효 픽셀 추출, 깊이 불연속 필터,
+               정점 재매핑, 색상·법선 인덱싱
+        CPU:   scipy 2D Delaunay (O(N log N) — 30K pts ≈ 0.5s)
+
+        장점:
+          - 서브샘플 수로 삼각형 밀도 직접 제어 (max_points ≈ 2× 삼각형 수)
+          - 큰 삼각형이 픽셀 노이즈를 평균화 → 요철 없음
+          - Poisson·Voxel 없음, CPU 부하 최소
+        """
+        import torch
+        from scipy.spatial import Delaunay
+
+        device = torch.device(self.device if torch.cuda.is_available() else "cpu")
+
+        # ── GPU: 유효 픽셀 좌표 추출 ─────────────────────────────
+        mask_t   = torch.tensor(mask,   dtype=torch.bool,    device=device)
+        valid_hw = mask_t.nonzero(as_tuple=False)            # (N, 2): [row, col]
+        N = len(valid_hw)
+        if N < 10:
+            return None
+
+        # ── GPU: 서브샘플링 ──────────────────────────────────────
+        if N > self.max_points:
+            perm     = torch.randperm(N, device=device)[: self.max_points]
+            valid_hw = valid_hw[perm]
+            N        = self.max_points
+
+        rows = valid_hw[:, 0]   # (N,) GPU long
+        cols = valid_hw[:, 1]   # (N,) GPU long
+
+        # ── GPU: 3D 좌표·색상·법선 추출 ──────────────────────────
+        pts_full  = torch.tensor(points, dtype=torch.float32, device=device)  # (H,W,3)
+        cols_full = torch.tensor(colors, dtype=torch.uint8,   device=device)  # (H,W,3)
+
+        pts_valid  = pts_full[rows, cols]   # (N, 3)
+        cols_valid = cols_full[rows, cols]  # (N, 3) uint8
+
+        if normals is not None:
+            nrm_full  = torch.tensor(normals, dtype=torch.float32, device=device)
+            nrm_valid = nrm_full[rows, cols]  # (N, 3)
+        else:
+            nrm_valid = None
+
+        # ── CPU: 2D Delaunay (픽셀 col·row = x·y 평면) ───────────
+        hw_np   = valid_hw.cpu().numpy()          # (N, 2): [row, col]
+        xy_np   = hw_np[:, ::-1].copy()           # (N, 2): [col, row]
+        tri     = Delaunay(xy_np)
+        faces_cpu = tri.simplices                 # (F, 3)
+
+        # ── CPU: 마스크 경계 필터 ────────────────────────────────
+        # Delaunay는 convex hull을 전부 삼각화하므로, 오목한 마스크나
+        # 두 분리 영역 사이를 가로지르는 삼각형이 생긴다.
+        # → 각 삼각형 무게중심이 레이블 마스크 안에 있는 것만 유지.
+        r0 = hw_np[faces_cpu[:, 0], 0];  c0 = hw_np[faces_cpu[:, 0], 1]
+        r1 = hw_np[faces_cpu[:, 1], 0];  c1 = hw_np[faces_cpu[:, 1], 1]
+        r2 = hw_np[faces_cpu[:, 2], 0];  c2 = hw_np[faces_cpu[:, 2], 1]
+        cr = np.clip(np.round((r0 + r1 + r2) / 3).astype(int), 0, mask.shape[0] - 1)
+        cc = np.clip(np.round((c0 + c1 + c2) / 3).astype(int), 0, mask.shape[1] - 1)
+        faces_cpu = faces_cpu[mask[cr, cc]]
+
+        if len(faces_cpu) == 0:
+            return None
+
+        # ── GPU: 깊이 불연속 필터 ────────────────────────────────
+        faces_t = torch.tensor(faces_cpu, dtype=torch.long, device=device)
+        d       = pts_valid[:, 2]                 # z 값 (N,)
+        d0, d1, d2 = d[faces_t[:, 0]], d[faces_t[:, 1]], d[faces_t[:, 2]]
+        d_stk   = torch.stack([d0, d1, d2])
+        d_rng   = d_stk.max(0).values - d_stk.min(0).values
+        d_mean  = d_stk.mean(0).abs().clamp(min=1e-6)
+        faces_t = faces_t[(d_rng / d_mean) < self.depth_discontinuity]
+
+        if len(faces_t) == 0:
+            return None
+
+        # ── GPU: 사용된 정점만 추출 + 재매핑 ─────────────────────
+        uniq, inverse = torch.unique(faces_t.reshape(-1), return_inverse=True)
+        verts     = pts_valid[uniq]                          # (V, 3)
+        v_colors  = cols_valid[uniq]                         # (V, 3) uint8
+        v_normals = nrm_valid[uniq] if nrm_valid is not None else torch.zeros(0, 3, device=device)
+        faces_out = inverse.reshape(-1, 3).to(torch.int32)  # (F', 3)
+
+        return MeshData(
+            vertices=verts.cpu().numpy().astype(np.float32),
+            faces=faces_out.cpu().numpy(),
+            normals=v_normals.cpu().numpy().astype(np.float32),
+            colors=v_colors.cpu().numpy(),
+        )
 
     # ── range_image: 픽셀 격자 → 삼각형 (100% GPU) ─────────────────
 

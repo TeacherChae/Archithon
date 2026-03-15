@@ -43,7 +43,7 @@ class PipelineConfig:
         ]
 
     # ── Mesh ──────────────────────────────────────────────────
-    mesh_method:                str   = os.getenv("MESH_METHOD", "range_image")
+    mesh_method:                str   = os.getenv("MESH_METHOD", "delaunay2d")
     mesh_depth:                 int   = int(os.getenv("MESH_DEPTH", "8"))
     mesh_max_points:            int   = int(os.getenv("MESH_MAX_POINTS", "150000"))
     mesh_voxel_resolution:      int   = int(os.getenv("MESH_VOXEL_RESOLUTION", "128"))
@@ -134,7 +134,7 @@ class ArchithonPipeline:
             )
 
         # ── Step 4: 포인트 레이블링 ───────────────────────────
-        if cfg.mesh_method == "range_image":
+        if cfg.mesh_method in ("range_image", "delaunay2d"):
             # 구조화 포인트맵을 직접 사용 — PointLabeler 스킵
             print("\n[4/5] Range Image Mesh 모드 — 포인트 레이블링 생략")
             cloud = None
@@ -151,7 +151,7 @@ class ArchithonPipeline:
 
         # ── Step 5: 메시 재구성 ───────────────────────────────
         print("\n[5/5] 메시 재구성...")
-        if cfg.mesh_method == "range_image":
+        if cfg.mesh_method in ("range_image", "delaunay2d"):
             meshes = self.reconstructor.reconstruct_structured(
                 points=depth.points,
                 valid_mask=depth.mask,
