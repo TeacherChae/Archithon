@@ -32,3 +32,7 @@ scikit-image
 
 # Rhino 3DM 내보내기 (레이어 지원)
 rhino3dm
+
+setuptools < 80
+
+einops decord pycocotools psutil
