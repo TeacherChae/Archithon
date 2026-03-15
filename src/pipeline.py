@@ -43,10 +43,11 @@ class PipelineConfig:
         ]
 
     # ── Mesh ──────────────────────────────────────────────────
-    mesh_method:           str = os.getenv("MESH_METHOD", "voxel_mc")
-    mesh_depth:            int = int(os.getenv("MESH_DEPTH", "8"))
-    mesh_max_points:       int = int(os.getenv("MESH_MAX_POINTS", "150000"))
-    mesh_voxel_resolution: int = int(os.getenv("MESH_VOXEL_RESOLUTION", "128"))
+    mesh_method:                str   = os.getenv("MESH_METHOD", "range_image")
+    mesh_depth:                 int   = int(os.getenv("MESH_DEPTH", "8"))
+    mesh_max_points:            int   = int(os.getenv("MESH_MAX_POINTS", "150000"))
+    mesh_voxel_resolution:      int   = int(os.getenv("MESH_VOXEL_RESOLUTION", "128"))
+    mesh_depth_discontinuity:   float = float(os.getenv("MESH_DEPTH_DISCONTINUITY", "0.05"))
     mesh_output_formats: list[str] = field(
         default_factory=lambda: os.getenv("MESH_OUTPUT_FORMATS", "glb,ply").split(",")
     )
@@ -84,6 +85,7 @@ class ArchithonPipeline:
             depth=cfg.mesh_depth,
             max_points=cfg.mesh_max_points,
             voxel_resolution=cfg.mesh_voxel_resolution,
+            depth_discontinuity=cfg.mesh_depth_discontinuity,
             device=cfg.device,
         )
 
@@ -132,19 +134,34 @@ class ArchithonPipeline:
             )
 
         # ── Step 4: 포인트 레이블링 ───────────────────────────
-        print("\n[4/5] 포인트 레이블링...")
-        cloud = self.labeler.label(image, depth, seg)
-        for lbl, pts in cloud.points.items():
-            print(f"      {lbl}: {len(pts):,} pts")
-        if intermediates:
-            cloud.save(os.path.join(out, "step4_cloud"))
-            Visualizer.save_labeled_cloud_image(
-                image, cloud, os.path.join(out, "step4_cloud", "cloud_vis.png")
-            )
+        if cfg.mesh_method == "range_image":
+            # 구조화 포인트맵을 직접 사용 — PointLabeler 스킵
+            print("\n[4/5] Range Image Mesh 모드 — 포인트 레이블링 생략")
+            cloud = None
+        else:
+            print("\n[4/5] 포인트 레이블링...")
+            cloud = self.labeler.label(image, depth, seg)
+            for lbl, pts in cloud.points.items():
+                print(f"      {lbl}: {len(pts):,} pts")
+            if intermediates:
+                cloud.save(os.path.join(out, "step4_cloud"))
+                Visualizer.save_labeled_cloud_image(
+                    image, cloud, os.path.join(out, "step4_cloud", "cloud_vis.png")
+                )
 
         # ── Step 5: 메시 재구성 ───────────────────────────────
         print("\n[5/5] 메시 재구성...")
-        meshes = self.reconstructor.reconstruct(cloud)
+        if cfg.mesh_method == "range_image":
+            meshes = self.reconstructor.reconstruct_structured(
+                points=depth.points,
+                valid_mask=depth.mask,
+                masks=seg.masks,
+                labels=seg.labels,
+                colors=image.rgb,
+                normals=depth.normal,
+            )
+        else:
+            meshes = self.reconstructor.reconstruct(cloud)
         mesh_dir = os.path.join(out, "step5_mesh")
         saved = self.reconstructor.save(
             meshes, mesh_dir, formats=cfg.mesh_output_formats

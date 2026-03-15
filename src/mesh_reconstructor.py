@@ -26,12 +26,13 @@ class MeshData:
 class MeshReconstructor:
     def __init__(
         self,
-        method: Literal["voxel_mc", "poisson", "bpa", "alpha"] = "voxel_mc",
-        depth: int = 9,                    # poisson 전용
-        radii: list[float] | None = None,  # bpa 전용
+        method: Literal["range_image", "gpu_poisson", "voxel_mc", "poisson", "bpa", "alpha"] = "range_image",
+        depth: int = 9,                        # poisson / gpu_poisson 전용
+        radii: list[float] | None = None,      # bpa 전용
         voxel_size: float | None = None,
         max_points: int = 150_000,
-        voxel_resolution: int = 128,       # voxel_mc 전용
+        voxel_resolution: int = 128,           # voxel_mc 전용
+        depth_discontinuity: float = 0.05,     # range_image 전용: 깊이 불연속 임계 비율
         device: str = "cuda",
     ):
         self.method = method
@@ -40,9 +41,46 @@ class MeshReconstructor:
         self.voxel_size = voxel_size
         self.max_points = max_points
         self.voxel_resolution = voxel_resolution
+        self.depth_discontinuity = depth_discontinuity
         self.device = device
 
     # ── public ─────────────────────────────────────────────────────
+
+    def reconstruct_structured(
+        self,
+        points: np.ndarray,          # (H, W, 3) depth.points — 카메라 좌표계
+        valid_mask: np.ndarray,      # (H, W) bool depth.mask — MoGe 유효 픽셀
+        masks: list,                 # list of (H, W) bool — SAM 레이블별 마스크
+        labels: list,                # list of str
+        colors: np.ndarray,          # (H, W, 3) uint8 image.rgb
+        normals: np.ndarray | None,  # (H, W, 3) depth.normal
+    ) -> dict[str, MeshData]:
+        """
+        구조화 포인트맵(H,W,3)에서 직접 메시 생성 — Poisson/Voxel 없음.
+
+        MoGe 출력이 이미 픽셀 격자 구조이므로 인접 픽셀을 삼각형으로 연결.
+        100% GPU (torch), O(H×W).
+        """
+        meshes: dict[str, MeshData] = {}
+
+        for label, mask in zip(labels, masks):
+            combined = mask & valid_mask
+            if combined.sum() < 10:
+                print(f"[{label}] 유효 픽셀 부족 ({combined.sum()}px), 스킵")
+                continue
+
+            mesh = self._range_image_mesh(
+                points=points,
+                mask=combined,
+                colors=colors,
+                normals=normals,
+            )
+
+            if mesh is not None:
+                meshes[label] = mesh
+                print(f"[{label}] 메시: {len(mesh.vertices):,}v / {len(mesh.faces):,}t")
+
+        return meshes
 
     def reconstruct(self, cloud: LabeledCloud) -> dict[str, MeshData]:
         meshes: dict[str, MeshData] = {}
@@ -55,7 +93,9 @@ class MeshReconstructor:
             cols = cloud.colors.get(label)
             nrm = cloud.normals.get(label)
 
-            if self.method == "voxel_mc":
+            if self.method == "gpu_poisson":
+                mesh = self._gpu_poisson(pts, cols, nrm)
+            elif self.method == "voxel_mc":
                 mesh = self._voxel_mc(pts, cols)
             else:
                 mesh = self._open3d_reconstruct(pts, cols, nrm)
@@ -289,6 +329,186 @@ print(f"[3dm] 저장 완료: {out_path}  ({len(meshes)} 레이어)")
                 print(result.stdout.strip())
         finally:
             os.unlink(tmp_path)
+
+    # ── range_image: 픽셀 격자 → 삼각형 (100% GPU) ─────────────────
+
+    def _range_image_mesh(
+        self,
+        points: np.ndarray,          # (H, W, 3) 카메라 좌표계
+        mask: np.ndarray,            # (H, W) bool — 이 레이블의 유효 픽셀
+        colors: np.ndarray,          # (H, W, 3) uint8
+        normals: np.ndarray | None,  # (H, W, 3)
+    ) -> "MeshData | None":
+        """
+        인접 픽셀 4개를 쿼드(삼각형 2개)로 연결.
+
+        CUDA 연산:
+          - 쿼드 유효성 검사 (마스크 AND, 깊이 불연속 필터)
+          - 정점 인덱스 재매핑 (unique + inverse)
+          - 색상·법선 인덱싱
+        CPU:
+          - 없음 (최종 numpy 변환만)
+
+        깊이 불연속 필터:
+          쿼드 내 최대·최소 Z 차이가
+          mean(Z) * depth_discontinuity_ratio 초과 시 삼각형 생성 스킵.
+          → 객체 경계·오클루전 부분에서 늘어난 삼각형 방지.
+        """
+        import torch
+
+        device = torch.device(self.device if torch.cuda.is_available() else "cpu")
+        H, W = mask.shape
+
+        pts_t   = torch.tensor(points,  dtype=torch.float32, device=device)  # (H, W, 3)
+        mask_t  = torch.tensor(mask,    dtype=torch.bool,    device=device)  # (H, W)
+        depth_t = pts_t[..., 2]                                               # (H, W) Z값
+
+        # ── 쿼드 4 꼭짓점 마스크 ─────────────────────────────────
+        # 쿼드 (i,j): 좌상=(i,j), 좌하=(i+1,j), 우상=(i,j+1), 우하=(i+1,j+1)
+        m00 = mask_t[:-1, :-1]   # (H-1, W-1)
+        m10 = mask_t[1:,  :-1]
+        m01 = mask_t[:-1, 1:]
+        m11 = mask_t[1:,  1:]
+        quad_valid = m00 & m10 & m01 & m11
+
+        # ── 깊이 불연속 필터 ─────────────────────────────────────
+        d00 = depth_t[:-1, :-1]
+        d10 = depth_t[1:,  :-1]
+        d01 = depth_t[:-1, 1:]
+        d11 = depth_t[1:,  1:]
+
+        stacked   = torch.stack([d00, d10, d01, d11], dim=0)
+        depth_rng = stacked.max(0).values - stacked.min(0).values
+        mean_d    = stacked.mean(0).abs().clamp(min=1e-6)
+        quad_valid = quad_valid & (depth_rng / mean_d < self.depth_discontinuity)
+
+        # ── 유효 쿼드 인덱스 → 평탄화 픽셀 인덱스 ───────────────
+        qi = quad_valid.nonzero(as_tuple=False)   # (Q, 2): (row, col)
+        if len(qi) == 0:
+            return None
+
+        rows, cols = qi[:, 0], qi[:, 1]
+        idx00 = rows * W + cols            # (Q,)
+        idx10 = (rows + 1) * W + cols
+        idx01 = rows * W + (cols + 1)
+        idx11 = (rows + 1) * W + (cols + 1)
+
+        # 삼각형 와인딩 (카메라 좌표계 Z-forward, 법선이 카메라를 향하도록)
+        # tri A: (i,j) → (i+1,j) → (i,j+1)
+        # tri B: (i+1,j+1) → (i,j+1) → (i+1,j)
+        tri_a = torch.stack([idx00, idx10, idx01], dim=1)   # (Q, 3)
+        tri_b = torch.stack([idx11, idx01, idx10], dim=1)   # (Q, 3)
+        faces_flat = torch.cat([tri_a, tri_b], dim=0)       # (2Q, 3)
+
+        # ── 사용된 픽셀만 정점으로 추출 ──────────────────────────
+        unique_px, inverse = torch.unique(faces_flat.reshape(-1), return_inverse=True)
+        # unique_px: (V,) 픽셀 인덱스 / inverse: (2Q*3,) 새 인덱스
+
+        pts_flat  = pts_t.reshape(-1, 3)
+        verts     = pts_flat[unique_px]                        # (V, 3)
+        faces_new = inverse.reshape(-1, 3).to(torch.int32)    # (2Q, 3)
+
+        # 색상
+        cols_t   = torch.tensor(colors, dtype=torch.uint8, device=device).reshape(-1, 3)
+        v_colors = cols_t[unique_px]                           # (V, 3) uint8
+
+        # 법선
+        if normals is not None:
+            nrm_t   = torch.tensor(normals, dtype=torch.float32, device=device).reshape(-1, 3)
+            v_norms = nrm_t[unique_px]                         # (V, 3)
+        else:
+            v_norms = torch.zeros(0, 3, device=device)
+
+        return MeshData(
+            vertices=verts.cpu().numpy().astype(np.float32),
+            faces=faces_new.cpu().numpy(),
+            normals=v_norms.cpu().numpy().astype(np.float32),
+            colors=v_colors.cpu().numpy(),
+        )
+
+    # ── gpu_poisson: CUDA 전처리 + CPU Screened Poisson ────────────
+
+    def _gpu_poisson(
+        self,
+        pts: np.ndarray,
+        colors: np.ndarray | None,
+        normals: np.ndarray | None,
+    ) -> "MeshData | None":
+        """
+        CUDA 전처리 + CPU Screened Poisson 재구성.
+
+        CUDA 사용:
+          - 포인트 서브샘플링 (torch.randperm on GPU)
+          - 법선 카메라 방향 정렬 (torch 벡터 연산 on GPU)
+        CPU:
+          - Open3D Screened Poisson solver
+          MoGe-2-vitl-normal이 법선을 이미 출력하므로
+          estimate_normals() 생략 → Poisson 에서 가장 느린 단계 제거.
+        """
+        import torch
+        import open3d as o3d
+
+        device = torch.device(self.device if torch.cuda.is_available() else "cpu")
+
+        pts_t = torch.tensor(pts, dtype=torch.float32, device=device)
+        N = len(pts_t)
+
+        # ── 1. GPU 서브샘플링 ──────────────────────────────────────
+        if N > self.max_points:
+            idx = torch.randperm(N, device=device)[: self.max_points]
+            idx_np = idx.cpu().numpy()
+            pts_t = pts_t[idx]
+            colors = colors[idx_np] if colors is not None else None
+            normals = normals[idx_np] if normals is not None else None
+            print(f"  GPU 서브샘플: {N:,} → {len(pts_t):,} pts")
+
+        # ── 2. GPU 법선 카메라 방향 정렬 ──────────────────────────
+        #    MoGe는 카메라 좌표계 출력: 카메라 = 원점
+        #    dot(normal, -point) < 0  →  법선이 카메라 반대 방향 → flip
+        if normals is not None:
+            nrm_t = torch.tensor(normals, dtype=torch.float32, device=device)
+            flip_mask = (nrm_t * pts_t).sum(dim=1) > 0  # dot(n, pt) > 0 → 뒤집기
+            nrm_t[flip_mask] = -nrm_t[flip_mask]
+            normals = nrm_t.cpu().numpy()
+
+        pts_cpu = pts_t.cpu().numpy().astype(np.float64)
+
+        # ── 3. CPU Screened Poisson (법선 외부 제공 → estimate 생략) ──
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_cpu)
+
+        if normals is not None:
+            pcd.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
+        else:
+            # MoGe normal 없는 경우 fallback (느림)
+            print("  MoGe 법선 없음 — CPU estimate_normals() 실행 (느릴 수 있음)")
+            pcd.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+            )
+            pcd.orient_normals_consistent_tangent_plane(100)
+
+        if colors is not None and len(colors) == len(pts_cpu):
+            pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+
+        try:
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                pcd, depth=self.poisson_depth, linear_fit=False
+            )
+            # 밀도 낮은 부동 삼각형 제거
+            dens = np.asarray(densities)
+            mesh.remove_vertices_by_mask(dens < np.quantile(dens, 0.05))
+        except Exception as e:
+            print(f"  Poisson 실패: {e}")
+            return None
+
+        mesh.compute_vertex_normals()
+        v = np.asarray(mesh.vertices).astype(np.float32)
+        f = np.asarray(mesh.triangles).astype(np.int32)
+        n = np.asarray(mesh.vertex_normals).astype(np.float32)
+        c_raw = np.asarray(mesh.vertex_colors)
+        c = (c_raw * 255).astype(np.uint8) if len(c_raw) == len(v) else np.zeros((0, 3), dtype=np.uint8)
+
+        return MeshData(vertices=v, faces=f, normals=n, colors=c)
 
     # ── voxel_mc: GPU 복셀화 + CPU marching cubes ───────────────────
 
