@@ -10,7 +10,8 @@
       "Bash(pip:*)",
       "Bash(source:*)",
       "Read(*)",
-      "Write(*)"
+      "Write(*)",
+      "Bash(.venv/bin/pip list:*)"
     ],
     "deny": []
   }
